@@ -1,28 +1,20 @@
-import json
-
-import overpy
-import pandas as pd
-import geopandas as gpd
-from netapy import defaults
-from tqdm import tqdm
+import ast
 
 class Assessor():
 
+    # Definitions, e.g. "footpath" <=> OSM tags
     def __init__(self):
-        self.STREET_KEYS = defaults.NETASCORE_STREET_KEYS.copy()
-        #self.STREET_KEYS.append("reversed")
 
         # Conditions as objects
-        #self.is_reversed = lambda x: x["reversed"] if "reversed" in x else False
         self.is_segregated = lambda x: any(key for key, value in x.items() if
                                       'segregated' in key and value == 'yes')  # and no "nos" in segregated, zB 4746913 hat cycleway:left:segregated = no !
-        self.is_footpath = lambda x: x["highway"] in ["footway", "pedestrian"]
+        self.is_footpath = lambda x: x.get("highway") in ["footway", "pedestrian"]
         self.is_not_accessible = lambda x: x.get("access") == "no"
         self.use_sidepath = lambda x: any(key for key, value in x.items() if 'bicycle' in key and value == 'use_sidepath')
 
         self.is_indoor = lambda x: x.get('indoor') == 'yes'
-        self.is_path = lambda x: x["highway"] in ["path"]
-        self.is_track = lambda x: x["highway"] in ["track"]
+        self.is_path = lambda x: x.get("highway") in ["path"]
+        self.is_track = lambda x: x.get("highway") in ["track"]
 
         self.can_walk_right = lambda x: (x.get("foot") in ["yes", "designated"]
                                     or any(
@@ -69,11 +61,11 @@ class Assessor():
                                                     x.get("sidewalk:right:foot") == "designated" or
                                                     x.get("sidewalk:foot") == "designated")
 
-        self.is_service_tag = lambda x: x["highway"] in ["service"]  # , "living_street"]
+        self.is_service_tag = lambda x: x.get("highway") in ["service"]  # , "living_street"]
         self.is_agricultural = lambda x: x.get("motor_vehicle") in ["agricultural", "forestry"]
-        self.is_accessible = lambda x: pd.isnull(x["access"]) or not self.is_not_accessible(x)
-        self.is_smooth = lambda x: pd.isnull(x["tracktype"]) or x["tracktype"] in ["grade1", "grade2"]
-        self.is_vehicle_allowed = lambda x: pd.isnull(x.get("motor_vehicle")) or x.get("motor_vehicle") != "no"
+        self.is_accessible = lambda x: x.get("access") is None or not self.is_not_accessible(x)
+        self.is_smooth = lambda x: x.get("tracktype") is None or x.get("tracktype") in ["grade1", "grade2"]
+        self.is_vehicle_allowed = lambda x: x.get("motor_vehicle") is None or x.get("motor_vehicle") != "no"
 
         self.is_service = lambda x: (self.is_service_tag(x) or
                                 (self.is_agricultural(x) and self.is_accessible(x)) or
@@ -81,13 +73,13 @@ class Assessor():
                                 (self.is_track(x) and self.is_accessible(x) and self.is_smooth(x) and self.is_vehicle_allowed(
                                     x))) and not self.is_designated(x)
 
-        self.can_cardrive = lambda x: x["highway"] in ["motorway", "trunk", "primary", "secondary", "tertiary",
+        self.can_cardrive = lambda x: x.get("highway") in ["motorway", "trunk", "primary", "secondary", "tertiary",
                                                   "unclassified", "road",
                                                   "residential", "living_street",
                                                   "primary_link", "secondary_link", "tertiary_link", 'motorway_link',
                                                   'trunk_link']
 
-        self.is_path_not_forbidden = lambda x: ((x["highway"] in ["cycleway", "track", "path"])
+        self.is_path_not_forbidden = lambda x: ((x.get("highway") in ["cycleway", "track", "path"])
                                            and not self.cannot_bike(x))
 
         self.is_bikepath_right = lambda x: (x.get("highway") in ["cycleway"]
@@ -145,77 +137,16 @@ class Assessor():
                                      or x.get("cycleway:left") == "share_busway"
                                      or x.get("cycleway:both") == "share_busway")
 
-    def test_osm_way(self, osm_id):
-        overpass_api = overpy.Overpass()
-        overpass_query = f"way({osm_id});(._;>;);out body;"
-        result = overpass_api.query(overpass_query)
-        way = result.ways[0].tags
-        return way
-
-    #remove unneccesary street keys to speed up processing
-    def _prepare_way(self, way_dict):
-        if isinstance(way_dict, gpd.GeoDataFrame):
-            if 'tags' in way_dict.columns:
-                #way_gdf = self._assess_directionality(way_dict) # explodes gdf and assesses whether linestrings are reversed or not
-                way_gdf = way_dict
-                way_gdf['tags'] = way_gdf['tags'].apply(json.loads)
-                way_gdf.reset_index(drop=True, inplace=True)
-                way_n = pd.concat([way_gdf, pd.json_normalize(way_gdf['tags'])], axis=1)
-                way_n = way_n[way_n.columns.intersection(self.STREET_KEYS)]
-                way_dictionary = way_n.to_dict('records')
-                return way_dictionary
-
-            elif 'tag_string' in way_dict.columns:
-                parse = []
-                for index, row in way_dict.iterrows():
-                    pairs = row['tag_string'].split(',')
-                    row_data = {kv.split('=>')[0]: kv.split('=>')[1] for kv in pairs if '=>' in kv}
-                    parse.append(row_data)
-                way_dataframe = pd.DataFrame(parse)
-                dropcol = [col for col in self.STREET_KEYS if col in way_dataframe.columns]
-                way_dataframe = way_dataframe[dropcol]
-                way_dictionary = way_dataframe.to_dict('records')
-                return way_dictionary
-
-            else:
-                raise ValueError("OSM dataframe must contain a tag column")
-
-        elif isinstance(way_dict, dict):
-            return {k: v for k, v in way_dict.items() if k in self.STREET_KEYS}
-
-        else:
-            raise TypeError("invalid format")
-
-    def _assess_directionality(self, way_gdf):
-        way_gdf_exp = way_gdf.explode().reset_index().drop(columns=['level_0', 'level_1'])
-        way_gdf_exp['start_point'] = way_gdf_exp['geometry'].apply(lambda x: list(x.coords)[0])
-        way_gdf_exp['end_point'] = way_gdf_exp['geometry'].apply(lambda x: list(x.coords)[1])
-        #way_gdf_exp['reversed'] = way_gdf_exp.apply(lambda x: x['end_point'] < x['start_point'], axis=1)
-        return way_gdf_exp
-
-    #optional:
-    def col_parser(self, osm_df):
-        # parse = []
-        # for index, row in osm_df.iterrows():
-        #     # Split the tag_string by commas to separate out each key-value pair
-        #     pairs = row['tag_string'].split(',')
-        #     # Split each pair by '=>' and form a dictionary of key-value pairs
-        #     row_data = {kv.split('=>')[0]: kv.split('=>')[1] for kv in pairs if '=>' in kv}
-        #     parse.append(row_data)
-        # sr_buffer_tags = pd.DataFrame(parse)
-        # dropcol = [col for col in NETASCORE_STREET_KEYS if col in sr_buffer_tags.columns]
-        # sr_buffer_tags = sr_buffer_tags[dropcol]
-        raise NotImplementedError
-
+    # Maps an OSM way to a Radsim cycling infrastructure category.
+    #
+    # @param `sides` The category complexity, e.g. either `bicycle_way` or `bicycle_way_right_no[ne]_left`:
+    # @param `x` The OSM way to categorize.
+    # @returns The Radsim category as String, e.g. `bicycle_way_right_no_left`.
     def set_value(self, x, sides = "double"):
-        if not isinstance(x, dict):
-            raise TypeError("rowwise OSM data should be a dict")
 
-        # should be changed to (or at least sometimes alternatively used as) "not cannot_bike?". It can be used at least for x["highway"] == "cycleway", where adding bicycle tag seems redundant.
-        # The condition could be than split: (x["highway"] == "cycleway" and not cannot_bike) OR (the_rest and can_bike)
+        # ------------ conditions ------------
 
-        ## bicycle_way
-        # First option: "bicycle_way_right"
+        # `bicycle_way` (right/left)
         conditions_b_way_right = [
             self.is_bikepath_right(x) and not self.can_walk_right(x),  # 0 and 1
             self.is_bikepath_right(x) and self.is_segregated(x),  # 0 and 2
@@ -224,7 +155,6 @@ class Assessor():
             self.can_bike(x) and self.is_obligated_segregated(x),  # 3,7
             self.is_bicycle_designated_right and self.is_pedestrian_designated_right(x) and self.is_segregated(x)
         ]
-
         conditions_b_way_left = [
             self.is_bikepath_left(x) and not self.can_walk_left(x),  # 0 and 1
             self.is_bikepath_left(x) and self.is_segregated(x),  # 0 and 2
@@ -234,8 +164,7 @@ class Assessor():
             self.is_bicycle_designated_left and self.is_pedestrian_designated_left(x) and self.is_segregated(x)
         ]
 
-        # Second option: "mixed_way"
-        ##mixed
+        # `mixed_way` (right/left)
         conditions_mixed_right = [
             self.is_bikepath_right(x) and self.can_walk_right(x) and not self.is_segregated(x),  # 0 and 1 and 2
             self.is_footpath(x) and self.can_bike(x) and not self.is_segregated(x),  # 3 and 4 and 2
@@ -247,8 +176,7 @@ class Assessor():
             (self.is_path(x) or self.is_track(x)) and self.can_bike(x) and self.can_walk_left(x) and not self.is_segregated(x)  # 5 and 4 and 1 and 2
         ]
 
-        # Add. Option: mit_road
-        ##mit
+        # `mit_road` (right/left)
         conditions_mit_right = [
             self.can_cardrive(x) and not self.is_bikepath_right(x) and not self.is_bikeroad(x) and not self.is_footpath(x) and not self.is_bikelane_right(x) and not self.is_buslane_right(x)
             and not self.is_path(x) and not self.is_track(x) and not self.cannot_bike(x),
@@ -258,14 +186,10 @@ class Assessor():
             and not self.is_path(x) and not self.is_track(x) and not self.cannot_bike(x),
         ]
 
-        # ##infrastructure designated for pedestrians
-        # is_pedestrian_right = lambda x: ((self.is_footpath(x) and not self.can_bike(x) and not self.is_indoor(x))
-        #                                  or (self.is_path(x) and self.can_walk_right(x) and not self.can_bike(x) and not self.is_indoor(x)))  # alternatively: (is_path or is_track)?
-        #
-        # is_pedestrian_left = lambda x: ((self.is_footpath(x) and not self.can_bike(x) and not self.is_indoor(x))
-        #                                 or (self.is_path(x) and self.can_walk_left(x) and not self.can_bike(x) and not self.is_indoor(x)))  # alternatively: (is_path or is_track)?
-
+        # Map to complex categories (w/ right_left) - relevant for OSM -> Radsim Mapping
         if sides == "double":
+
+            # Map function
             def get_infra(x):
 
                 if ('access' in x.values() and self.is_not_accessible(x)) or ('tram' in x.values() and x['tram'] == 'yes'):
@@ -422,100 +346,44 @@ class Assessor():
                 else:
                     return "no"
 
-            cat = None
-            cat = get_infra(x)
-            # making sure that the variable cat has been filled
-            assert (isinstance(cat, str))
+            return get_infra(x) # Validate NOT NULL
 
-            """ #old, from when we thought that "reversed" is part of OSM
-            if ("_both" in cat) or (
-                    cat in ["no", "cycle_highway", "bicycle_road", "path_not_forbidden", "service_misc"]):
-                return cat
-            else:
-                # for categories with "right & left" - revert if needed
-                if not self.is_reversed(x):
-                    return cat
-                else:
-                    sides = ["left", "right"] if cat.split("_")[-1] == "right" else ["right", "left"]
-                    for side in sides:
-                        cat = " ".join(cat.split(side))
+# Function to parse the custom OSM tags format
+def parse_osm_tags(input_str):
+    # Remove the surrounding braces
+    if input_str.startswith('{') and input_str.endswith('}'):
+        input_str = input_str[1:-1]
+    else:
+        raise ValueError("Input must start with '{' and end with '}'")
+    # Split by commas to get key=value pairs
+    items = input_str.split(',')
+    tags = {}
+    for item in items:
+        # Split by '='
+        key_value = item.strip().split('=')
+        if len(key_value) != 2:
+            raise ValueError(f"Invalid key=value pair: {item}")
+        key, value = key_value
+        key = key.strip()
+        value = value.strip()
+        tags[key] = value
+    return tags
 
-                    res = cat.split()
-                    return res[0] + sides[1] + res[1] + sides[0]
-            """
-            return cat
+if __name__ == "__main__":
+    assessor = Assessor()
+    print("Please enter the OSM tags to test-map.")
+    print("Enter the tags in the format:")
+    print("{key1=value1, key2=value2, ...}")
+    print("Example:")
+    print("{highway=path, bicycle=designated}")
+    user_input = input("Enter OSM tags: ")
 
-        else:
-            assert(sides == "single")
-
-
-            def get_infra(x):
-                if ('access' in x.values() and self.is_not_accessible(x)) or ('tram' in x.values() and x['tram'] == 'yes'):
-                    return 'no'  # unpacked from "service"
-                # remove service right away
-
-                if self.is_service(x):
-                    return "service_misc"
-
-                if self.is_cycle_highway(x):
-                    return "cycle_highway"
-
-                #### 3 # new option: "bicycle_road"
-                if self.is_bikeroad(x):
-                    return "bicycle_road"
-
-                #### 1
-                elif any(conditions_b_way_left) or any(conditions_b_way_right):
-                    return "bicycle_way"
-
-                #### 4 # Third option: "bicycle_lane"
-                elif self.is_bikelane_left(x) or self.is_bikelane_right(x):
-                    return "bicycle_lane"
-
-                #### 5 # Fourth option: "bus_lane"
-                elif self.is_buslane_left(x) or self.is_buslane_right(x):
-                    return "bus_lane"
-
-                #### 2
-                elif any(conditions_mixed_left) or any(conditions_mixed_right):
-                    return "mixed_way"
-
-                #### 6
-                elif any(conditions_mit_left) or any(conditions_mit_right):
-                    return "mit_road"
-
-                elif (self.is_pedestrian_left(x) or self.is_pedestrian_right(x)) and (not 'indoor' in x.values() or (x['indoor'] != 'yes')):
-                    if 'access' in x.values() and x['access'] == 'customers':
-                        return "no"
-                    else:
-                        return "pedestrian"
-
-                elif self.is_path_not_forbidden(x):
-                    return "path_not_forbidden"
-
-                #### Fallback option: "no"
-                else:
-                    return "no"
-
-            cat = None
-            cat = get_infra(x)
-            # making sure that the variable cat has been filled
-            assert (isinstance(cat, str))
-
-            return cat
-
-    def assess(self, osm_df, sides="single"):
-        try:
-            prepared_data = self._prepare_way(osm_df)
-
-            osm_infra = []
-            for kante in tqdm(prepared_data, total=len(prepared_data)):
-                result = self.set_value(kante, sides=sides)
-                osm_infra.append(result)
-            #osm_df = osm_df.explode()
-            osm_df['bicycle_infrastructure:forward'] = osm_infra
-            return osm_df
-
-        except Exception as e:
-            print(f"An error occurred during assessment: {str(e)}")
-            return None
+    try:
+        # Parse the input string using the custom parser
+        test_tags = parse_osm_tags(user_input)
+        result = assessor.set_value(test_tags)
+        print()
+        print(f"This maps to: {result}")
+    except ValueError as e:
+        print("Invalid input. Please enter the tags in the correct format.")
+        print(f"Error: {e}")
